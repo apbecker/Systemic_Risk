@@ -73,6 +73,7 @@ class World(object):
     def __init__(self, data, structure, spread, other_spread, risk_dict):
         # Dataframe. Index: Banks, Columns: Asset classes, name, capital
         self._data = data
+        self._prep_data = None
         # Geo-structure of banks' investments, usually inferred from sovereign debt
         self._structure = structure
         # Spreading parameters
@@ -154,14 +155,18 @@ class World(object):
         for bank in data.index.values:
             banks[bank] = Bank(bank, self.getName(bank),
                                self.getCapital(bank),
-                               self.getByAssetClass(bank=bank),
+                               self.getByAsset(bank=bank),
                                self.getGeoStructure(bank=bank))
-        
+
         for bank in banks:                
             obj = banks[bank]
             hol = obj.getHoldingsByAsset()
             rwa = hol.dot(self.getInitRiskWeights(self._assets))
             obj.capital = rwa/obj.capital
+        
+        self._prep_data = pd.DataFrame(data=None, columns=hol.columns)
+        for bank in banks:
+            self._prep_data = self._prep_data.append(banks[bank].getHoldingsByAsset())
             
         return banks
     
@@ -192,56 +197,71 @@ class World(object):
             obj.riskweight = np.minimum(shockfactor*obj.riskweight, 2)
         return "Shock set for countries."
     
-    def propShockToBanks(self, banks, assets, time):
+    def propShockToBanks(self, banks, assets_df, time):
         t = str(time)
         df = self.evolution_banks
         
-        rws = pd.DataFrame(data=[[asset, assets[asset].riskweight] for asset in assets],
-                           columns=["asset", "weight"]).set_index("asset")
-        for bank in banks:
-            df.loc[bank, "W_"+t] = banks[bank].getRWA(assets).values[0]
-            df.loc[bank, "R_"+t] = banks[bank].getCapital().values[0][0] / df.loc[bank, "W_"+t] 
+        banks_df = pd.DataFrame(data=[[bank, banks[bank].getCapital().values[0][0]]
+                                      for bank in banks],
+                                columns=["bank", "capital"]).set_index("bank")
+        banks_df.loc[:, "rwa"] = self._prep_data.dot(assets_df.loc[:, "rws"])
+
+        df.loc[:, "W_"+t] = banks_df.loc[:, "rwa"]
+        df.loc[:, "R_"+t] = banks_df.loc[:, "capital"] / banks_df.loc[:, "rwa"]
         
         self.evolution_banks = df.sort_index()
         return self.evolution_banks, banks
     
-    def propShockToAssets(self, banks, assets, time):
+    def propShockToAssets(self, assets, assets_df, time):
         t = str(time)
         df = self.evolution_assets
-        
         
         omega_s = pd.DataFrame(data=None, columns=["omega", "q"], index=self.evolution_assets.index)
         
         if time > 1:
-            delta_R = P(self.evolution_banks.loc[:, "R_"+str(time-1)] / self.evolution_banks.loc[:, "R_"+str(time-3)])
+            delta_R = self.evolution_banks.loc[:, "R_"+str(time-1)] / self.evolution_banks.loc[:, "R_"+str(time-3)]
+            delta_R = delta_R.apply(P)
             delta_R = delta_R.dot(self.getByAsset()) / np.sum(self.getByAsset())
-
-            for asset in assets:
-                omega_s.loc[asset, "q"] = assets[asset].getSpread()
-                omega_s.loc[asset, "omega"] = 1 - omega_s.loc[asset, "q"] * (1-delta_R.loc[asset])
-                df.loc[asset, "r_"+t] = np.minimum(assets[asset].riskweight / np.square(omega_s.loc[asset, "omega"]), 2)
-                df.loc[asset, "S_"+t] = assets[asset].getValue() * df.loc[asset, "r_"+str(time-2)]/df.loc[asset, "r_"+t]
+            
+            omega_s.loc[:, "q"] = assets_df.loc[:, "q"]
+            omega_s.loc[:, "omega"] = 1 - omega_s.loc[:, "q"] * (1-delta_R)
+            
+            # df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / np.square(omega_s.loc[:, "omega"])
+            df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / omega_s.loc[:, "omega"]
+            df.loc[:, "r_"+t] = np.minimum(df.loc[:, "r_"+t].to_frame(), 2)
+            # df.loc[:, "S_"+t] = assets_df.loc[:, "value"] * df.loc[:, "r_"+str(time-2)]/df.loc[:, "r_"+t]
+            
+            
         else:
-            for asset in assets:
-                df.loc[asset, "r_"+t] = assets[asset].riskweight
-                df.loc[asset, "S_"+t] = assets[asset].getValue()
+            df.loc[:, "r_"+t] = assets_df.loc[:, "rws"]
+            # df.loc[:, "S_"+t] = assets_df.loc[:, "value"]
             
             
         for asset in assets:             
             assets[asset].riskweight = df.loc[asset, "r_"+t]
             
-        self.evolution_assets = df
+        self.evolution_assets = df.sort_index()
         return self.evolution_assets, assets
     
+    
     def runShock(self, banks, assets, shocksector, shockcountries, shockfactor):
-        evo_a, assets = self.propShockToAssets(banks, assets, 0)
-        evo_b, banks  = self.propShockToBanks(banks, assets, 0)
+        assets_df = pd.DataFrame(data=[[asset, assets[asset].getSpread(), 
+                                        assets[asset].riskweight, assets[asset].getValue()]
+                                       for asset in assets],
+                                 columns=["asset", "q", "rws", "value"]).set_index("asset")
+        
+        evo_a, assets = self.propShockToAssets(assets, assets_df, 0)
+        evo_b, banks  = self.propShockToBanks(banks, assets_df, 0)
         self.initShock(assets, shocksector, shockcountries, shockfactor)
         for t in range(1,20):
+            assets_df = pd.DataFrame(data=[[asset, assets[asset].getSpread(), 
+                                            assets[asset].riskweight, assets[asset].getValue()]
+                                           for asset in assets],
+                                     columns=["asset", "q", "rws", "value"]).set_index("asset")
             if np.mod(t,2) == 1:
-                evo_a, assets = self.propShockToAssets(banks, assets, t)
+                evo_a, assets = self.propShockToAssets(assets, assets_df, t)
             else:
-                evo_b, banks  = self.propShockToBanks(banks, assets, t)
+                evo_b, banks  = self.propShockToBanks(banks, assets_df, t)
         
         return evo_a, evo_b
     
@@ -338,9 +358,8 @@ class Bank(World):
         self._structure = structure
         
         
-    
     def __str__(self):
-        return '{}, capital {}, RWA {}'.format(self._name, self._capital, self.getRWA())  
+        return '{}, capital {}'.format(self._name, self._capital)  
     
     
     def getData(self):
@@ -389,39 +408,42 @@ class Bank(World):
     capital = property(getCapital, setCapital)
     
     
-    def getRWA(self, assets):
-        rws = pd.DataFrame(data=[[asset, assets[asset].riskweight] for asset in assets],
-                           columns=["asset", "weight"]).set_index("asset")
+    def getRWA(self, rws):
         return self.getHoldingsByAsset().dot(rws)
     
     
     def getHoldingsByAssetClass(self, asset_class=None):
-        return dfSelecter(self._data, rows=self.getBankID(), columns=asset_class)
+        df = dfSelecter(self._prep_data, rows=self.getBankID())
+        if asset_class != None:
+            df = df.filter(like=asset_class)
+        
+        return df
     
     
     def getHoldingsByAsset(self, asset_class=None, asset=None):
         # Data frame with banks' investments
         df = self.getByAssetClass(asset_class=asset_class)
         # Geo-structure of banks' investments
-        weights_df = self.getGeoStructure()
+        #weights_df = self.getGeoStructure()
         
         
         # Make sure we didn't pass a series
-        if type(df) == pd.Series:
-            df = df.to_frame().T       
-        if type(weights_df) == pd.Series:
-            weights_df = weights_df.to_frame().T        
+        #if type(df) == pd.Series:
+        #    df = df.to_frame().T       
+        #if type(weights_df) == pd.Series:
+        #    weights_df = weights_df.to_frame().T        
         
         # Multiply each asset class to split up by country
-        asset_classes = df.columns
-        df_list = [weights_df.multiply(df.loc[:, ac], axis=0) 
-                   for ac in asset_classes]
+        #asset_classes = df.columns
+        #df_list = [weights_df.multiply(df.loc[:, ac], axis=0) 
+        #           for ac in asset_classes]
         
         # Concatenate data frames for each asset class and rename columns
-        full_df = pd.concat(df_list, axis=1)
-        full_df.columns = [col+"_"+ind for col in asset_classes 
-                           for ind in weights_df.columns]
-        return full_df
+        #full_df = pd.concat(df_list, axis=1)
+        #full_df.columns = [col+"_"+ind for col in asset_classes 
+        #                   for ind in weights_df.columns]
+        #return full_df
+        return df
     
     
     def getGeoStructure(self):
@@ -520,5 +542,3 @@ class Asset(World):
     def getCrisisLevel(self):
         return self.riskweight/self.staticriskweight
     
-
-
