@@ -70,10 +70,11 @@ class World(object):
     'Common base class for all realizations of stress test'
     # To be passed: Dataframe containing asset classes, name, capital
     # To be passed: Dataframe containing how much banks are invested where
-    def __init__(self, data, structure, spread, other_spread, risk_dict):
+    def __init__(self, data, structure, spread, other_spread, risk_dict, T_max=20):
         # Dataframe. Index: Banks, Columns: Asset classes, name, capital
         self._data = data
         self._prep_data = None
+        self._T_max = T_max
         # Geo-structure of banks' investments, usually inferred from sovereign debt
         self._structure = structure
         # Spreading parameters
@@ -186,6 +187,7 @@ class World(object):
                 obj.spread = self._spread.loc[obj.getCountry(), "Q"]
             else:
                 obj.spread = self._other_spread
+            #obj.spread = self._spread.loc[obj.getCountry(), "Q"]
                 
         return assets
     
@@ -195,7 +197,10 @@ class World(object):
         for asset in shocklist:
             obj = assets[asset]
             obj.riskweight = np.minimum(shockfactor*obj.riskweight, 2)
+            #if self.sect_dict[shocksector.lower()] != "1_Sov":
+            #    obj.spread = 1
         return "Shock set for countries."
+    
     
     def propShockToBanks(self, banks, assets_df, time):
         t = str(time)
@@ -226,19 +231,22 @@ class World(object):
             omega_s.loc[:, "q"] = assets_df.loc[:, "q"]
             omega_s.loc[:, "omega"] = 1 - omega_s.loc[:, "q"] * (1-delta_R)
             
-            # df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / np.square(omega_s.loc[:, "omega"])
+            df.loc[:, "r^2_"+t] = df.loc[:, "r^2_"+str(time-2)] / np.square(omega_s.loc[:, "omega"])
+            df.loc[:, "r^2_"+t] = np.minimum(df.loc[:, "r^2_"+t].to_frame(), 2)
             df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / omega_s.loc[:, "omega"]
             df.loc[:, "r_"+t] = np.minimum(df.loc[:, "r_"+t].to_frame(), 2)
             # df.loc[:, "S_"+t] = assets_df.loc[:, "value"] * df.loc[:, "r_"+str(time-2)]/df.loc[:, "r_"+t]
             
             
         else:
+            df.loc[:, "r^2_"+t] = assets_df.loc[:, "rws"]
             df.loc[:, "r_"+t] = assets_df.loc[:, "rws"]
             # df.loc[:, "S_"+t] = assets_df.loc[:, "value"]
             
             
-        for asset in assets:             
-            assets[asset].riskweight = df.loc[asset, "r_"+t]
+        risk_dict = df.loc[:, "r_"+t].to_dict()
+        for asset in risk_dict:             
+            assets[asset].riskweight = risk_dict[asset]
             
         self.evolution_assets = df.sort_index()
         return self.evolution_assets, assets
@@ -250,10 +258,11 @@ class World(object):
                                        for asset in assets],
                                  columns=["asset", "q", "rws", "value"]).set_index("asset")
         
+        
         evo_a, assets = self.propShockToAssets(assets, assets_df, 0)
         evo_b, banks  = self.propShockToBanks(banks, assets_df, 0)
         self.initShock(assets, shocksector, shockcountries, shockfactor)
-        for t in range(1,20):
+        for t in range(1,self._T_max):
             assets_df = pd.DataFrame(data=[[asset, assets[asset].getSpread(), 
                                             assets[asset].riskweight, assets[asset].getValue()]
                                            for asset in assets],
