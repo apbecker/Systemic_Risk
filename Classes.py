@@ -3,6 +3,10 @@ import numpy as np
 
 # Functions from the model        
 def P(x):
+    return np.minimum(0.1 + 0.9*x**2, 1)
+
+
+def P_lin(x):
     return np.minimum(0.1 + 0.9*x, 1)
 
 def Q(x):
@@ -70,11 +74,10 @@ class World(object):
     'Common base class for all realizations of stress test'
     # To be passed: Dataframe containing asset classes, name, capital
     # To be passed: Dataframe containing how much banks are invested where
-    def __init__(self, data, structure, spread, other_spread, risk_dict, T_max=20):
+    def __init__(self, data, structure, spread, other_spread, risk_dict):
         # Dataframe. Index: Banks, Columns: Asset classes, name, capital
         self._data = data
         self._prep_data = None
-        self._T_max = T_max
         # Geo-structure of banks' investments, usually inferred from sovereign debt
         self._structure = structure
         # Spreading parameters
@@ -166,6 +169,7 @@ class World(object):
             obj.capital = rwa/obj.capital
         
         self._prep_data = pd.DataFrame(data=None, columns=hol.columns)
+
         for bank in banks:
             self._prep_data = self._prep_data.append(banks[bank].getHoldingsByAsset())
             
@@ -187,19 +191,23 @@ class World(object):
                 obj.spread = self._spread.loc[obj.getCountry(), "Q"]
             else:
                 obj.spread = self._other_spread
-            #obj.spread = self._spread.loc[obj.getCountry(), "Q"]
                 
         return assets
     
     
-    def initShock(self, assets, shocksector, shockcountries, shockfactor):
+    def initShockAssets(self, assets, shocksector, shockcountries, shockfactor):
         shocklist = [self.sect_dict[shocksector.lower()] + "_" + c for c in shockcountries]
         for asset in shocklist:
             obj = assets[asset]
             obj.riskweight = np.minimum(shockfactor*obj.riskweight, 2)
-            #if self.sect_dict[shocksector.lower()] != "1_Sov":
-            #    obj.spread = 1
         return "Shock set for countries."
+    
+    
+    def initShockBanks(self, banks, shockbanks, capitalreducedby):
+        for bank in shockbanks:
+            obj = banks[bank]
+            obj.capital = obj.capital * (1.-capitalreducedby)
+        return "Shock set for banks."
     
     
     def propShockToBanks(self, banks, assets_df, time):
@@ -231,38 +239,40 @@ class World(object):
             omega_s.loc[:, "q"] = assets_df.loc[:, "q"]
             omega_s.loc[:, "omega"] = 1 - omega_s.loc[:, "q"] * (1-delta_R)
             
-            df.loc[:, "r^2_"+t] = df.loc[:, "r^2_"+str(time-2)] / np.square(omega_s.loc[:, "omega"])
-            df.loc[:, "r^2_"+t] = np.minimum(df.loc[:, "r^2_"+t].to_frame(), 2)
+            # df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / np.square(omega_s.loc[:, "omega"])
             df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / omega_s.loc[:, "omega"]
             df.loc[:, "r_"+t] = np.minimum(df.loc[:, "r_"+t].to_frame(), 2)
             # df.loc[:, "S_"+t] = assets_df.loc[:, "value"] * df.loc[:, "r_"+str(time-2)]/df.loc[:, "r_"+t]
             
             
         else:
-            df.loc[:, "r^2_"+t] = assets_df.loc[:, "rws"]
             df.loc[:, "r_"+t] = assets_df.loc[:, "rws"]
             # df.loc[:, "S_"+t] = assets_df.loc[:, "value"]
             
             
-        risk_dict = df.loc[:, "r_"+t].to_dict()
-        for asset in risk_dict:             
-            assets[asset].riskweight = risk_dict[asset]
+        for asset in assets:             
+            assets[asset].riskweight = df.loc[asset, "r_"+t]
             
         self.evolution_assets = df.sort_index()
         return self.evolution_assets, assets
     
     
     def runShock(self, banks, assets, shocksector, shockcountries, shockfactor):
+        return self.runShockAssets(banks, assets, shocksector, shockcountries, shockfactor)
+        
+    
+    def runShockAssets(self, banks, assets, shocksector, shockcountries, shockfactor):
         assets_df = pd.DataFrame(data=[[asset, assets[asset].getSpread(), 
                                         assets[asset].riskweight, assets[asset].getValue()]
                                        for asset in assets],
                                  columns=["asset", "q", "rws", "value"]).set_index("asset")
         
-        
         evo_a, assets = self.propShockToAssets(assets, assets_df, 0)
         evo_b, banks  = self.propShockToBanks(banks, assets_df, 0)
-        self.initShock(assets, shocksector, shockcountries, shockfactor)
-        for t in range(1,self._T_max):
+        self.initShockAssets(assets, shocksector, shockcountries, shockfactor)
+        t = 0
+        while True:
+            t = t+1
             assets_df = pd.DataFrame(data=[[asset, assets[asset].getSpread(), 
                                             assets[asset].riskweight, assets[asset].getValue()]
                                            for asset in assets],
@@ -271,8 +281,53 @@ class World(object):
                 evo_a, assets = self.propShockToAssets(assets, assets_df, t)
             else:
                 evo_b, banks  = self.propShockToBanks(banks, assets_df, t)
+                
+                abort_df = evo_b.filter(like="R_")
+                if max(abort_df.iloc[:, -2] - abort_df.iloc[:, -1]) <= 1e-2:
+                    break
+                if t >= 150:
+                    break
         
-        return evo_a, evo_b
+        return evo_a, evo_b, t
+    
+        
+    def runShockBanks(self, banks, assets, shockbanks, capitalreducedby):
+        if type(shockbanks) == str:
+            if shockbanks == "All":
+                shockbanks = banks.keys()
+            else:
+                shockbanks = [b for b in banks.keys() if b[0:2] == shockbanks]
+        elif len(shockbanks[0]) == 2:
+            shockbanks = [b for b in banks.keys() if b[0:2] in shockbanks]
+
+        
+        assets_df = pd.DataFrame(data=[[asset, assets[asset].getSpread(), 
+                                        assets[asset].riskweight, assets[asset].getValue()]
+                                       for asset in assets],
+                                 columns=["asset", "q", "rws", "value"]).set_index("asset")
+        
+        evo_a, assets = self.propShockToAssets(assets, assets_df, 0)
+        evo_b, banks  = self.propShockToBanks(banks, assets_df, 0)
+        self.initShockBanks(banks, shockbanks, capitalreducedby)
+        t = 0
+        while True:
+            t = t+1
+            assets_df = pd.DataFrame(data=[[asset, assets[asset].getSpread(), 
+                                            assets[asset].riskweight, assets[asset].getValue()]
+                                           for asset in assets],
+                                     columns=["asset", "q", "rws", "value"]).set_index("asset")
+            if np.mod(t,2) == 1:
+                evo_a, assets = self.propShockToAssets(assets, assets_df, t)
+            else:
+                evo_b, banks  = self.propShockToBanks(banks, assets_df, t)
+                
+                abort_df = evo_b.filter(like="R_")
+                if max(abort_df.iloc[:, -2] - abort_df.iloc[:, -1]) <= 1e-3:
+                    break
+                if t >= 150:
+                    break
+        
+        return evo_a, evo_b, t
     
     
     def getBanks(self):
