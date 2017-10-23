@@ -2,13 +2,6 @@ import pandas as pd
 import numpy as np
 
 # Functions from the model        
-def P(x):
-    return np.minimum(0.1 + 0.9*x**2, 1)
-
-
-def P_lin(x):
-    return np.minimum(0.1 + 0.9*x, 1)
-
 def Q(x):
     return 1. - 2**(-x/100.)
    
@@ -74,7 +67,7 @@ class World(object):
     'Common base class for all realizations of stress test'
     # To be passed: Dataframe containing asset classes, name, capital
     # To be passed: Dataframe containing how much banks are invested where
-    def __init__(self, data, structure, spread, other_spread, risk_dict):
+    def __init__(self, data, structure, spread, other_spread, risk_dict, P, t_limit=200, abort_thr=5e-5):
         # Dataframe. Index: Banks, Columns: Asset classes, name, capital
         self._data = data
         self._prep_data = None
@@ -87,10 +80,11 @@ class World(object):
         self._risk_dict = risk_dict
         self._sect_dict = \
             {"sov":"1_Sov", "fin":"2_Fin", "corp":"3_Corp", "ret_res":"4-1_Ret_Res", 
-             "ret_rev":"4-2_Ret_Rev", "ret_sme":"4-3_Ret_SME", "cre":"5_CRE"}
+             "ret_rev":"4-2_Ret_Rev", "ret_sme":"4-3_Ret_SME", "cre":"5_CRE", "bank":"0_Bank"}
         
-        # Which sector are we shocking
-        self._shockset = False
+        self.P = P
+        self.t_limit = t_limit
+        self.abort_thr = abort_thr
         
         # Populate children
         self._assets = self.initAssets(self.getByAsset())
@@ -166,7 +160,7 @@ class World(object):
             obj = banks[bank]
             hol = obj.getHoldingsByAsset()
             rwa = hol.dot(self.getInitRiskWeights(self._assets))
-            obj.capital = rwa/obj.capital
+            obj.capital = rwa * obj.capital
         
         self._prep_data = pd.DataFrame(data=None, columns=hol.columns)
 
@@ -233,21 +227,18 @@ class World(object):
         
         if time > 1:
             delta_R = self.evolution_banks.loc[:, "R_"+str(time-1)] / self.evolution_banks.loc[:, "R_"+str(time-3)]
-            delta_R = delta_R.apply(P)
+            delta_R = delta_R.apply(self.P)
             delta_R = delta_R.dot(self.getByAsset()) / np.sum(self.getByAsset())
             
             omega_s.loc[:, "q"] = assets_df.loc[:, "q"]
-            omega_s.loc[:, "omega"] = 1 - omega_s.loc[:, "q"] * (1-delta_R)
+            omega_s.loc[:, "omega"] = 1 - omega_s.loc[:, "q"]*(1-delta_R)
             
-            # df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / np.square(omega_s.loc[:, "omega"])
             df.loc[:, "r_"+t] = assets_df.loc[:, "rws"] / omega_s.loc[:, "omega"]
             df.loc[:, "r_"+t] = np.minimum(df.loc[:, "r_"+t].to_frame(), 2)
-            # df.loc[:, "S_"+t] = assets_df.loc[:, "value"] * df.loc[:, "r_"+str(time-2)]/df.loc[:, "r_"+t]
             
             
         else:
             df.loc[:, "r_"+t] = assets_df.loc[:, "rws"]
-            # df.loc[:, "S_"+t] = assets_df.loc[:, "value"]
             
             
         for asset in assets:             
@@ -283,9 +274,9 @@ class World(object):
                 evo_b, banks  = self.propShockToBanks(banks, assets_df, t)
                 
                 abort_df = evo_b.filter(like="R_")
-                if max(abort_df.iloc[:, -2] - abort_df.iloc[:, -1]) <= 1e-2:
+                if max(abort_df.iloc[:, -2] - abort_df.iloc[:, -1]) <= self.abort_thr:
                     break
-                if t >= 150:
+                if t >= self.t_limit:
                     break
         
         return evo_a, evo_b, t
@@ -322,9 +313,9 @@ class World(object):
                 evo_b, banks  = self.propShockToBanks(banks, assets_df, t)
                 
                 abort_df = evo_b.filter(like="R_")
-                if max(abort_df.iloc[:, -2] - abort_df.iloc[:, -1]) <= 1e-3:
+                if max(abort_df.iloc[:, -2] - abort_df.iloc[:, -1]) <= 5e-5:
                     break
-                if t >= 150:
+                if t >= 200:
                     break
         
         return evo_a, evo_b, t
@@ -476,37 +467,23 @@ class Bank(World):
         return self.getHoldingsByAsset().dot(rws)
     
     
-    def getHoldingsByAssetClass(self, asset_class=None):
-        df = dfSelecter(self._prep_data, rows=self.getBankID())
-        if asset_class != None:
-            df = df.filter(like=asset_class)
+    def getHoldingsByAssetClass(self, asset_class=None): 
+        df = self.getHoldingsByAsset()
+        valid_sectors = ["1_Sov", "2_Fin", "3_Corp", "4-1_Ret_Res", "4-2_Ret_Rev", "4-3_Ret_SME", "5_CRE"]
+        byasset = []
+        sect = valid_sectors[0]
         
-        return df
+        for sec in valid_sectors:
+            byasset.append([sec, df.filter(like=sec).apply(np.sum, axis=1).values[0]])
+        
+        df = pd.DataFrame(data=byasset, columns=["Sector", "Holdings"]).set_index("Sector")
+        return dfSelecter(df, rows=asset_class)
+        
     
     
     def getHoldingsByAsset(self, asset_class=None, asset=None):
         # Data frame with banks' investments
         df = self.getByAssetClass(asset_class=asset_class)
-        # Geo-structure of banks' investments
-        #weights_df = self.getGeoStructure()
-        
-        
-        # Make sure we didn't pass a series
-        #if type(df) == pd.Series:
-        #    df = df.to_frame().T       
-        #if type(weights_df) == pd.Series:
-        #    weights_df = weights_df.to_frame().T        
-        
-        # Multiply each asset class to split up by country
-        #asset_classes = df.columns
-        #df_list = [weights_df.multiply(df.loc[:, ac], axis=0) 
-        #           for ac in asset_classes]
-        
-        # Concatenate data frames for each asset class and rename columns
-        #full_df = pd.concat(df_list, axis=1)
-        #full_df.columns = [col+"_"+ind for col in asset_classes 
-        #                   for ind in weights_df.columns]
-        #return full_df
         return df
     
     
